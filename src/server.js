@@ -1,8 +1,10 @@
 import childProcess from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import express from "express";
 import httpProxy from "http-proxy";
@@ -150,6 +152,85 @@ function cleanPtyOutput(value) {
     .filter((line) => line && !isTransientProgressLine(line))
     .join("\n");
   return cleaned ? `${cleaned}\n` : "";
+}
+
+let deviceBootstrapSdkPromise = null;
+
+function resolveDeviceBootstrapSdkPath() {
+  const entryPath = path.resolve(OPENCLAW_ENTRY);
+  try {
+    const requireFromOpenclaw = createRequire(entryPath);
+    return requireFromOpenclaw.resolve("openclaw/plugin-sdk/device-bootstrap");
+  } catch {
+    const openclawRoot = path.dirname(path.dirname(entryPath));
+    return path.join(openclawRoot, "dist", "plugin-sdk", "device-bootstrap.js");
+  }
+}
+
+async function loadDeviceBootstrapSdk() {
+  if (!deviceBootstrapSdkPromise) {
+    deviceBootstrapSdkPromise = import(
+      pathToFileURL(resolveDeviceBootstrapSdkPath()).href
+    ).catch((err) => {
+      deviceBootstrapSdkPromise = null;
+      throw err;
+    });
+  }
+  return deviceBootstrapSdkPromise;
+}
+
+async function probeDeviceBootstrapSdk() {
+  try {
+    await loadDeviceBootstrapSdk();
+    log.info(
+      "devices",
+      `device bootstrap SDK ready: ${resolveDeviceBootstrapSdkPath()}`,
+    );
+  } catch (err) {
+    log.warn(
+      "devices",
+      `device bootstrap SDK unavailable at startup (${resolveDeviceBootstrapSdkPath()}): ${err?.message || String(err)}`,
+    );
+  }
+}
+
+function devicePairingTimestamp(request) {
+  const ts = request?.ts;
+  if (typeof ts === "number") return ts;
+  if (typeof ts === "string") {
+    const parsed = Date.parse(ts);
+    return Number.isNaN(parsed) ? 0 : parsed;
+  }
+  return 0;
+}
+
+function newestPendingDevicePairing(pending) {
+  if (!Array.isArray(pending) || pending.length === 0) return null;
+  return pending.reduce((latest, current) =>
+    devicePairingTimestamp(current) > devicePairingTimestamp(latest)
+      ? current
+      : latest,
+  );
+}
+
+function describeDeviceApprovalForbidden(result) {
+  const scope = result?.scope || "unknown";
+  const role = result?.role || "unknown";
+
+  switch (result?.reason) {
+    case "caller-scopes-required":
+      return `missing scope: ${scope}`;
+    case "caller-missing-scope":
+      return `missing scope: ${scope}`;
+    case "scope-outside-requested-roles":
+      return `invalid scope for requested roles: ${scope}`;
+    case "bootstrap-role-not-allowed":
+      return `bootstrap profile does not allow role: ${role}`;
+    case "bootstrap-scope-not-allowed":
+      return `bootstrap profile does not allow scope: ${scope}`;
+    default:
+      return "Device approval is forbidden by bootstrap policy.";
+  }
 }
 
 function configPath() {
@@ -1233,37 +1314,84 @@ app.post("/setup/api/doctor", requireSetupAuth, async (_req, res) => {
 });
 
 app.get("/setup/api/devices", requireSetupAuth, async (_req, res) => {
-  const args = ["devices", "list", "--json", "--token", OPENCLAW_GATEWAY_TOKEN];
-  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
-  log.info("devices", `list exit=${result.code} output=${result.output}`);
   try {
-    const jsonMatch = result.output.match(/(\{[\s\S]*\}|\[[\s\S]*\])\s*$/);
-    if (!jsonMatch) {
-      log.warn("devices", "no JSON found in output");
-      return res.json({ ok: result.code === 0, raw: result.output });
-    }
-    const data = JSON.parse(jsonMatch[1]);
-    log.info("devices", `parsed keys=${Object.keys(data)} pending=${JSON.stringify(data.pending)} paired=${JSON.stringify(data.paired)}`);
-    return res.json({ ok: true, data, raw: result.output });
-  } catch (parseErr) {
-    log.warn("devices", `JSON parse failed: ${parseErr.message}`);
-    return res.json({ ok: result.code === 0, raw: result.output });
+    const { listDevicePairing } = await loadDeviceBootstrapSdk();
+    const data = await listDevicePairing();
+    log.info(
+      "devices",
+      `local list pending=${data?.pending?.length ?? 0} paired=${data?.paired?.length ?? 0}`,
+    );
+    return res.json({ ok: true, data });
+  } catch (err) {
+    const message = err?.message || String(err);
+    log.warn("devices", `local list failed: ${message}`);
+    return res.status(500).json({ ok: false, error: message });
   }
 });
 
 app.post("/setup/api/devices/approve", requireSetupAuth, async (req, res) => {
-  const { requestId } = req.body || {};
-  const args = ["devices", "approve"];
-  if (requestId) {
-    args.push(String(requestId));
-  } else {
-    args.push("--latest");
+  const requestId = String(req.body?.requestId || "").trim();
+
+  try {
+    const { approveDevicePairing, listDevicePairing } =
+      await loadDeviceBootstrapSdk();
+    const pairings = await listDevicePairing();
+    const pending = Array.isArray(pairings?.pending) ? pairings.pending : [];
+
+    let targetRequestId = requestId;
+    if (targetRequestId) {
+      const exists = pending.some(
+        (request) => request?.requestId === targetRequestId,
+      );
+      if (!exists) {
+        return res.status(404).json({
+          ok: false,
+          error: `Unknown pending device pairing request: ${targetRequestId}`,
+        });
+      }
+    } else {
+      const latest = newestPendingDevicePairing(pending);
+      targetRequestId = latest?.requestId || "";
+      if (!targetRequestId) {
+        return res.status(404).json({
+          ok: false,
+          error: "No pending device pairing requests.",
+        });
+      }
+    }
+
+    const result = await approveDevicePairing(targetRequestId, {
+      // /setup is guarded by SETUP_PASSWORD and runs in the same state volume
+      // as the gateway, so it acts as the trusted bootstrap admin surface.
+      callerScopes: ["operator.admin"],
+    });
+
+    if (!result) {
+      return res.status(404).json({
+        ok: false,
+        error: `Unknown pending device pairing request: ${targetRequestId}`,
+      });
+    }
+
+    if (result.status === "forbidden") {
+      return res.status(403).json({
+        ok: false,
+        error: describeDeviceApprovalForbidden(result),
+        reason: result.reason,
+      });
+    }
+
+    return res.json({
+      ok: true,
+      requestId: targetRequestId,
+      device: result.device,
+      output: `Approved device pairing request ${targetRequestId}.`,
+    });
+  } catch (err) {
+    const message = err?.message || String(err);
+    log.error("devices", `local approve failed: ${message}`);
+    return res.status(500).json({ ok: false, error: message });
   }
-  args.push("--token", OPENCLAW_GATEWAY_TOKEN);
-  const result = await runCmd(OPENCLAW_NODE, clawArgs(args));
-  return res
-    .status(result.code === 0 ? 200 : 500)
-    .json({ ok: result.code === 0, output: result.output });
 });
 
 app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
@@ -1271,6 +1399,8 @@ app.post("/setup/api/devices/reject", requireSetupAuth, async (req, res) => {
   if (!requestId) {
     return res.status(400).json({ ok: false, error: "Missing requestId" });
   }
+  // TODO: switch this to the bootstrap SDK once rejectDevicePairing is exported
+  // from openclaw/plugin-sdk/device-bootstrap.
   const args = [
     "devices", "reject", String(requestId),
     "--token", OPENCLAW_GATEWAY_TOKEN,
@@ -1592,6 +1722,7 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `setup wizard: http://localhost:${PORT}/setup`);
   log.info("wrapper", `web TUI: ${ENABLE_WEB_TUI ? "enabled" : "disabled"}`);
   log.info("wrapper", `configured: ${isConfigured()}`);
+  void probeDeviceBootstrapSdk();
 
   if (isConfigured()) {
     (async () => {
