@@ -39,6 +39,9 @@
       loading: false,
       pairingChannel: '',
       pairingCode: '',
+      pairingSubmitting: false,
+      pairingResult: '',
+      pairingMessage: '',
       showPairingModal: false,
       isReady: false,
       tuiEnabled: false,
@@ -216,21 +219,29 @@
       openPairingModal() {
         this.pairingChannel = '';
         this.pairingCode = '';
+        this.pairingSubmitting = false;
+        this.pairingResult = '';
+        this.pairingMessage = '';
         this.showPairingModal = true;
       },
 
       async approvePairing() {
+        if (this.pairingSubmitting) return;
         const channel = this.pairingChannel.trim().toLowerCase();
         if (channel !== 'telegram' && channel !== 'discord') {
-          alert('Channel must be "telegram" or "discord"');
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Choose Telegram or Discord before approving.';
           return;
         }
         const code = this.pairingCode.trim();
         if (!code) {
-          alert('Please enter a pairing code');
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Enter the pairing code from the channel message.';
           return;
         }
-        this.showPairingModal = false;
+        this.pairingSubmitting = true;
+        this.pairingResult = 'pending';
+        this.pairingMessage = 'Approving channel access...';
         this.log += '\nApproving pairing for ' + channel + '...\n';
 
         try {
@@ -244,17 +255,21 @@
           let result;
           try { result = JSON.parse(t); } catch (_e) { result = { ok: false, output: t }; }
           if (result.ok) {
-            const msg = result.output || 'Pairing approved successfully';
-            this.log += '✓ ' + msg + '\n';
-            alert('✓ ' + msg.trim());
+            this.pairingResult = 'success';
+            this.pairingMessage = result.message || 'Channel access approved.';
+            this.log += '✓ ' + this.pairingMessage + '\n';
           } else {
-            const msg = result.output || result.error || 'Unknown error';
-            this.log += '✗ Failed: ' + msg + '\n';
-            alert('✗ Pairing failed: ' + msg.trim());
+            this.pairingResult = 'error';
+            this.pairingMessage = result.message || result.error || 'Channel approval failed.';
+            this.log += '✗ Pairing failed: ' + this.pairingMessage + '\n';
           }
+          if (result.output) this.log += result.output.trim() + '\n';
         } catch (e) {
+          this.pairingResult = 'error';
+          this.pairingMessage = 'Channel approval request failed. Check your connection and try again.';
           this.log += '✗ Error: ' + String(e) + '\n';
-          alert('✗ Pairing failed: ' + String(e));
+        } finally {
+          this.pairingSubmitting = false;
         }
       },
 
@@ -856,12 +871,12 @@
       </div>
     </div>
 
-    <div x-show="showPairingModal" x-cloak class="modal-overlay" @click.self="showPairingModal = false">
+    <div x-show="showPairingModal" x-cloak class="modal-overlay" @click.self="if (!pairingSubmitting) showPairingModal = false">
       <div class="modal-card modal-sm">
         <h3 class="modal-title mb-4">Approve Channel Access</h3>
         <div class="form-group">
           <label class="label">Channel</label>
-          <select x-model="pairingChannel" class="select">
+          <select x-model="pairingChannel" @change="pairingResult = ''; pairingMessage = ''" :disabled="pairingSubmitting" class="select">
             <option value="">Select channel...</option>
             <option value="telegram">Telegram</option>
             <option value="discord">Discord</option>
@@ -869,11 +884,21 @@
         </div>
         <div class="form-group">
           <label class="label">Pairing Code</label>
-          <input x-model="pairingCode" type="text" placeholder="e.g. 3EY4PUYS" class="input" />
+          <input x-model="pairingCode" @input="pairingResult = ''; pairingMessage = ''" :disabled="pairingSubmitting" type="text" placeholder="e.g. 3EY4PUYS" class="input" />
+        </div>
+        <div x-show="pairingResult" x-cloak role="status" aria-live="polite" class="pairing-status" :class="'pairing-status-' + pairingResult">
+          <span x-show="pairingResult === 'pending'" class="spinner spinner-inline" aria-hidden="true"></span>
+          <span x-text="pairingMessage"></span>
         </div>
         <div class="btn-pair">
-          <button @click="approvePairing()" class="btn btn-primary">Approve</button>
-          <button @click="showPairingModal = false" class="btn btn-close-full" style="margin-top:0">Cancel</button>
+          <button @click="approvePairing()" :disabled="pairingSubmitting || pairingResult === 'success'" class="btn btn-primary">
+            <span x-show="!pairingSubmitting">Approve</span>
+            <span x-show="pairingSubmitting" style="display:inline-flex;align-items:center;gap:0.5rem">
+              <span class="spinner spinner-inline" aria-hidden="true"></span>
+              Approving
+            </span>
+          </button>
+          <button @click="showPairingModal = false" :disabled="pairingSubmitting" class="btn btn-close-full" style="margin-top:0" x-text="pairingResult === 'success' ? 'Close' : 'Cancel'"></button>
         </div>
       </div>
     </div>

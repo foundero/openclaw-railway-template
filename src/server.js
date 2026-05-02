@@ -1271,18 +1271,58 @@ app.get("/setup/api/debug", requireSetupAuth, async (_req, res) => {
 
 app.post("/setup/api/pairing/approve", requireSetupAuth, async (req, res) => {
   const { channel, code } = req.body || {};
-  if (!channel || !code) {
+  const channelValue = String(channel || "").trim().toLowerCase();
+  const codeValue = String(code || "").trim();
+  if (!channelValue || !codeValue) {
     return res
       .status(400)
-      .json({ ok: false, error: "Missing channel or code" });
+      .json({
+        ok: false,
+        code: "invalid_request",
+        message: "Choose a channel and enter a pairing code.",
+        error: "Missing channel or code",
+      });
+  }
+  if (!["telegram", "discord"].includes(channelValue)) {
+    return res.status(400).json({
+      ok: false,
+      code: "invalid_channel",
+      message: "Channel must be Telegram or Discord.",
+      error: `Invalid channel: ${channelValue}`,
+    });
   }
   const r = await runCmd(
     OPENCLAW_NODE,
-    clawArgs(["pairing", "approve", String(channel), String(code)]),
+    clawArgs(["pairing", "approve", channelValue, codeValue]),
   );
-  return res
-    .status(r.code === 0 ? 200 : 500)
-    .json({ ok: r.code === 0, output: r.output });
+  const output = r.output || "";
+  const cleanOutput = stripAnsi(output);
+
+  if (r.code === 0) {
+    return res.status(200).json({
+      ok: true,
+      code: "approved",
+      message: "Channel access approved.",
+      output,
+    });
+  }
+
+  if (/no pending pairing request/i.test(cleanOutput)) {
+    return res.status(404).json({
+      ok: false,
+      code: "no_pending_request",
+      message:
+        "No pending request matched that code. It may already be approved, expired, or replaced by a newer code.",
+      output,
+    });
+  }
+
+  return res.status(500).json({
+    ok: false,
+    code: "pairing_failed",
+    message: "Channel approval failed. Review the log output for details.",
+    output,
+  });
 });
 
 app.post("/setup/api/reset", requireSetupAuth, async (_req, res) => {
